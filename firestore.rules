@@ -1,0 +1,49 @@
+rules_version = '2';
+// Paste into Firebase Console > Firestore > Rules.
+// The backend uses the Admin SDK, so it bypasses these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn() && request.auth.token.email_verified == true && (
+        request.auth.token.email == 'developer9692@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.token.email))
+      );
+    }
+
+    // Orders: users create their own (always 'processing'); only the backend changes them afterwards.
+    match /orders/{id} {
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'processing'
+        && !('providerOrderId' in request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /refills/{id} {
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // Public catalog, edited by admins (adding mapped services goes through the backend)
+    match /services/{id}  { allow read: if true; allow write: if isAdmin(); }
+    match /platforms/{id} { allow read: if true; allow write: if isAdmin(); }
+
+    // PRIVATE: provider service IDs and cost. Backend only.
+    match /serviceMap/{id} { allow read, write: if false; }
+
+    match /admins/{email} {
+      allow read: if signedIn() && (request.auth.token.email == email || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+  }
+}

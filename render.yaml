@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: venomix-backend
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: PROVIDER_API_KEY
+        sync: false
+      - key: PROVIDER_API_URL
+        value: https://cheapsmmmarket.com/api/v2
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: PROVIDER_CURRENCY_TO_INR
+        value: "0"
+      - key: DEFAULT_MARKUP_PERCENT
+        value: "30"

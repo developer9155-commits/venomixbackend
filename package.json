@@ -1,0 +1,19 @@
+{
+  "name": "venomix-backend",
+  "version": "1.0.0",
+  "description": "VENOMIX SMM backend: sends admin-approved orders to CheapSMMMarket",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "firebase-admin": "^12.6.0",
+    "helmet": "^7.1.0"
+  }
+}
