@@ -27,14 +27,42 @@ class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
-function loadServiceAccount() {
-  let raw = env('FIREBASE_SERVICE_ACCOUNT');
-  const b64 = env('FIREBASE_SERVICE_ACCOUNT_B64');
-  if (!raw && b64) raw = Buffer.from(b64, 'base64').toString('utf8');
-  if (!raw) throw new Error('Set FIREBASE_SERVICE_ACCOUNT (service account JSON) in the environment');
-  const sa = JSON.parse(raw);
-  if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
+function parseServiceAccount(value) {
+  let v = String(value || '').trim();
+  v = v.replace(/^(export\s+)?FIREBASE_SERVICE_ACCOUNT(_B64)?\s*=\s*/, '');       // pasted with the variable name
+  if (v.length > 1 && /^(["'])[\s\S]*\1$/.test(v) && !v.startsWith('"type"')) v = v.slice(1, -1).trim(); // wrapping quotes
+  if (!v) return null;
+  const tryJson = (s) => {
+    s = s.trim();
+    if (!s.startsWith('{')) s = '{' + s;
+    if (!s.endsWith('}')) s = s + '}';
+    try { const o = JSON.parse(s); return o && o.private_key ? o : null; } catch { return null; }
+  };
+  let sa = null;
+  if (v.startsWith('{') || v.startsWith('"type"')) sa = tryJson(v);          // plain JSON (any layout)
+  if (!sa) {                                                                  // base64 (whitespace tolerated)
+    const clean = v.replace(/\s+/g, '');
+    if (/^[A-Za-z0-9+/_-]+={0,2}$/.test(clean)) sa = tryJson(Buffer.from(clean, 'base64').toString('utf8'));
+  }
+  if (!sa) sa = tryJson(v);
   return sa;
+}
+function loadServiceAccount() {
+  const vars = ['FIREBASE_SERVICE_ACCOUNT', 'FIREBASE_SERVICE_ACCOUNT_B64'];
+  const seen = [];
+  for (const name of vars) {
+    const val = env(name);
+    if (!val) continue;
+    const sa = parseServiceAccount(val);
+    if (sa) {
+      sa.private_key = String(sa.private_key).replace(/\\n/g, '\n');
+      return sa;
+    }
+    seen.push(`${name} (${val.length} chars, starts "${val.slice(0, 4).replace(/[^\x20-\x7e]/g, '?')}")`);
+  }
+  throw new Error(seen.length
+    ? 'Could not read the Firebase key from ' + seen.join(' and ') + '. Value is incomplete or altered; re-copy the full key.'
+    : 'Set FIREBASE_SERVICE_ACCOUNT (or FIREBASE_SERVICE_ACCOUNT_B64) in the environment');
 }
 if (!ADMIN_EMAIL) { console.error('ADMIN_EMAIL is required'); process.exit(1); }
 try {
