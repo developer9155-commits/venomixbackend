@@ -104,7 +104,10 @@ async function providerServices(force) {
     at: Date.now(),
     data: list.map((s) => ({
       id: String(s.service), name: String(s.name || ''), category: String(s.category || ''), type: String(s.type || ''),
-      rate: Number(s.rate), min: Number(s.min), max: Number(s.max), refill: !!s.refill, cancel: !!s.cancel
+      rate: Number(s.rate) || 0,
+      min: Number.isFinite(Number(s.min)) && Number(s.min) > 0 ? Number(s.min) : 1,
+      max: Number.isFinite(Number(s.max)) && Number(s.max) > 0 ? Number(s.max) : 1000000000,
+      refill: !!s.refill, cancel: !!s.cancel
     }))
   };
   return svcCache.data;
@@ -117,17 +120,52 @@ function mapStatus(s) {
   return 'inprogress'; // pending, processing, in progress
 }
 const round2 = (n) => Math.round(n * 100) / 100;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Turns low-level Firebase/Firestore failures into a message you can act on (instead of a blank "Server error").
+function describeError(err) {
+  const code = err && err.code;
+  const msg = String((err && err.message) || '');
+  if (code === 5 || (/\bNOT_FOUND\b/.test(msg) && /firestore|database|project/i.test(msg)))
+    return 'Firestore database not found. Open Firebase Console > Firestore Database and create the database (Native mode) for this project.';
+  if (code === 7 || /PERMISSION_DENIED|Missing or insufficient permissions|API has not been used|SERVICE_DISABLED/i.test(msg))
+    return 'Firestore refused access. Enable the "Cloud Firestore API" in Google Cloud and give the service account the "Cloud Datastore User" (or Firebase Admin) role.';
+  if (code === 16 || /UNAUTHENTICATED|invalid_grant|DECODER|invalid.*private key|Getting metadata from plugin failed|Could not load the default credentials/i.test(msg))
+    return 'Firebase rejected the service account key (invalid, revoked or altered). Generate a new key and update FIREBASE_SERVICE_ACCOUNT.';
+  if (code === 8 || /RESOURCE_EXHAUSTED|quota/i.test(msg)) return 'Firestore quota exceeded. Try again later or upgrade the plan.';
+  if (code === 4 || code === 14 || /DEADLINE_EXCEEDED|UNAVAILABLE|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(msg))
+    return 'The database is temporarily unreachable. Please try again.';
+  return '';
+}
+
+async function updateWithRetry(ref, data, tries = 3) {
+  for (let i = 0; i < tries; i++) {
+    try { return await ref.update(data); }
+    catch (e) { if (i === tries - 1) throw e; await sleep(500 * (i + 1)); }
+  }
+}
+
+// An order stuck in 'sending' (server crashed / DB error mid-approval) is released after 5 minutes.
+const STALE_SENDING_MS = 5 * 60 * 1000;
+function isStaleSending(o) {
+  if (!o || o.status !== 'sending') return false;
+  const t = o.updatedAt && typeof o.updatedAt.toMillis === 'function' ? o.updatedAt.toMillis() : 0;
+  return Date.now() - t > STALE_SENDING_MS;
+}
 
 /* ---------------- app ---------------- */
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
+const normOrigin = (o) => String(o).trim().toLowerCase().replace(/\/$/, '').replace('://www.', '://');
+const ORIGINS_N = ORIGINS.map(normOrigin);
 app.use(cors({
   origin(origin, cb) {
-    if (!origin || !ORIGINS.length || ORIGINS.includes(origin.replace(/\/$/, ''))) return cb(null, true);
+    if (!origin || !ORIGINS_N.length || ORIGINS_N.includes(normOrigin(origin))) return cb(null, true);
+    console.warn('Blocked by CORS. Add this exact origin to ALLOWED_ORIGINS: ' + origin);
     cb(new HttpError(403, 'Origin not allowed'));
   },
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   maxAge: 600
 }));
@@ -153,6 +191,18 @@ async function requireAdmin(req, res, next) {
 }
 
 app.get(['/', '/health'], (req, res) => res.json({ ok: true, service: 'venomix-backend', time: new Date().toISOString() }));
+
+/* ---------- diagnostics (admin only): shows exactly what is misconfigured ---------- */
+app.get('/api/admin/diagnostics', requireAdmin, ah(async (req, res) => {
+  const out = { node: process.version, adminEmail: ADMIN_EMAIL, allowedOrigins: ORIGINS, providerKeySet: !!PROVIDER_KEY, firestore: 'ok', provider: 'ok' };
+  try { await db.collection('platforms').limit(1).get(); }
+  catch (e) { out.firestore = describeError(e) || ('error: ' + String(e.message).slice(0, 200)); }
+  try { const b = await provider({ action: 'balance' }); out.providerBalance = b.balance + ' ' + (b.currency || ''); }
+  catch (e) { out.provider = e.message; }
+  try { out.ordersStuckInSending = (await db.collection('orders').where('status', '==', 'sending').limit(50).get()).size; }
+  catch (e) { out.ordersStuckInSending = 'unknown'; }
+  res.json(out);
+}));
 
 /* ---------- provider info ---------- */
 app.get('/api/admin/provider/balance', requireAdmin, ah(async (req, res) => {
@@ -232,38 +282,49 @@ app.post('/api/admin/orders/:id/approve', requireAdmin, ah(async (req, res) => {
     if (!s.exists) throw new HttpError(404, 'Order not found');
     order = s.data(); prev = order.status;
     if (order.providerOrderId) throw new HttpError(409, 'This order was already sent to the provider');
-    if (!['processing', 'cancelled'].includes(order.status)) throw new HttpError(409, 'Order is already ' + order.status);
+    const stale = isStaleSending(order);
+    if (!['processing', 'cancelled'].includes(order.status) && !stale) throw new HttpError(409, 'Order is already ' + order.status);
+    if (stale) prev = 'processing';
     tx.update(ref, { status: 'sending', updatedAt: FV.serverTimestamp() });
   });
 
+  const release = (e) => ref.update({ status: prev, lastError: String((e && e.message) || e).slice(0, 300), updatedAt: FV.serverTimestamp() })
+    .catch((x) => console.error('Could not release order ' + ref.id + ':', x.message));
+
   const stamp = { approvedBy: req.admin.email, approvedAt: FV.serverTimestamp(), updatedAt: FV.serverTimestamp(), lastError: FV.delete() };
-  const [mapSnap, svcSnap] = await Promise.all([
-    db.collection('serviceMap').doc(String(order.serviceId)).get(),
-    db.collection('services').doc(String(order.serviceId)).get()
-  ]);
-  let warning = '';
-  if (svcSnap.exists) {
-    const expected = round2(Number(svcSnap.data().rate) * Number(order.quantity) / 1000);
-    if (Math.abs(expected - Number(order.amount)) > 1) warning = `Amount differs from the price list (paid ${order.amount}, list ${expected}). Check the payment.`;
-  }
-
-  if (!mapSnap.exists) { // service without provider mapping = manual fulfilment
-    await ref.update({ ...stamp, status: 'completed', fulfilment: 'manual' });
-    return res.json({ ok: true, status: 'completed', manual: true, warning });
-  }
-
-  const pid = String(mapSnap.data().providerServiceId);
-  let r;
+  let warning = '', pid = '', providerOrderId = '';
   try {
-    r = await provider({ action: 'add', service: pid, link: order.link, quantity: Number(order.quantity) });
+    const [mapSnap, svcSnap] = await Promise.all([
+      db.collection('serviceMap').doc(String(order.serviceId)).get(),
+      db.collection('services').doc(String(order.serviceId)).get()
+    ]);
+    if (svcSnap.exists) {
+      const expected = round2(Number(svcSnap.data().rate) * Number(order.quantity) / 1000);
+      if (Math.abs(expected - Number(order.amount)) > 1) warning = `Amount differs from the price list (paid ${order.amount}, list ${expected}). Check the payment.`;
+    }
+    if (!mapSnap.exists) { // service without provider mapping = manual fulfilment
+      await updateWithRetry(ref, { ...stamp, status: 'completed', fulfilment: 'manual' });
+      return res.json({ ok: true, status: 'completed', manual: true, warning });
+    }
+    pid = String(mapSnap.data().providerServiceId);
+    if (!order.link || !(Number(order.quantity) > 0)) throw new HttpError(422, 'Order has no link or quantity');
+    const r = await provider({ action: 'add', service: pid, link: String(order.link), quantity: Number(order.quantity) });
     if (!r || !r.order) throw new HttpError(502, 'Provider did not return an order ID');
+    providerOrderId = String(r.order);
   } catch (e) {
-    await ref.update({ status: prev, lastError: String(e.message).slice(0, 300), updatedAt: FV.serverTimestamp() }).catch(() => {});
+    await release(e);   // nothing was sent: put the order back so it can be approved/declined again
     throw e;
   }
-  console.log(`Order ${req.params.id} -> provider order ${r.order}`);
-  await ref.update({ ...stamp, status: 'inprogress', providerOrderId: String(r.order), providerServiceId: pid, providerStatus: 'Pending' });
-  res.json({ ok: true, status: 'inprogress', providerOrderId: String(r.order), warning });
+
+  // The provider has the order now. Saving must not silently fail, or the order could be sent twice.
+  console.log(`Order ${req.params.id} -> provider order ${providerOrderId}`);
+  try {
+    await updateWithRetry(ref, { ...stamp, status: 'inprogress', providerOrderId, providerServiceId: pid, providerStatus: 'Pending' });
+  } catch (e) {
+    console.error(`!! Order ${req.params.id} WAS SENT to provider as ${providerOrderId} but saving failed:`, e);
+    throw new HttpError(500, `Order was sent to the provider (provider order ${providerOrderId}) but saving it failed. Do NOT approve it again; note this ID.`);
+  }
+  res.json({ ok: true, status: 'inprogress', providerOrderId, warning });
 }));
 
 app.post('/api/admin/orders/:id/decline', requireAdmin, ah(async (req, res) => {
@@ -273,7 +334,7 @@ app.post('/api/admin/orders/:id/decline', requireAdmin, ah(async (req, res) => {
     if (!s.exists) throw new HttpError(404, 'Order not found');
     const o = s.data();
     if (o.providerOrderId) throw new HttpError(409, 'Already sent to the provider, it cannot be declined here');
-    if (o.status === 'sending') throw new HttpError(409, 'Order is being sent right now');
+    if (o.status === 'sending' && !isStaleSending(o)) throw new HttpError(409, 'Order is being sent right now. Try again in a few minutes');
     tx.update(ref, { status: 'cancelled', declinedBy: req.admin.email, updatedAt: FV.serverTimestamp() });
   });
   res.json({ ok: true, status: 'cancelled' });
@@ -346,15 +407,30 @@ app.post('/api/admin/refills/:id/send', requireAdmin, ah(async (req, res) => {
 /* ---------- errors ---------- */
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  if (res.headersSent) return next(err);
   if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
-  console.error(err);
-  res.status(500).json({ error: 'Server error' });
+  const st = err && (err.status || err.statusCode);
+  if (st >= 400 && st < 500) { // body-parser etc. (bad JSON, body too large)
+    const msg = err.type === 'entity.parse.failed' ? 'Invalid JSON in request body'
+      : err.type === 'entity.too.large' ? 'Request body too large' : (err.message || 'Bad request');
+    return res.status(st).json({ error: msg });
+  }
+  console.error(`[${req.method} ${req.originalUrl}]`, err);       // full details are in the server logs
+  const friendly = describeError(err);
+  const body = { error: friendly || 'Server error' };
+  if (req.admin) body.detail = String((err && err.message) || err).slice(0, 200); // only admins see the raw reason
+  res.status(friendly ? 503 : 500).json(body);
 });
+
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
 
 app.listen(PORT, () => {
   console.log('VENOMIX backend listening on ' + PORT);
   if (!PROVIDER_KEY) console.warn('WARNING: PROVIDER_API_KEY is not set');
   if (!ORIGINS.length) console.warn('WARNING: ALLOWED_ORIGINS is empty, any website can call this API (admin routes still need a login)');
+  db.collection('platforms').limit(1).get()
+    .then(() => console.log('Firestore connection OK'))
+    .catch((e) => console.error('!! FIRESTORE CHECK FAILED:', describeError(e) || e.message, '(code ' + e.code + ')'));
 });
 // background sync while the instance is awake
 setInterval(() => { syncAll().catch((e) => console.error('sync failed:', e.message)); }, 10 * 60 * 1000);
