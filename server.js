@@ -4,6 +4,7 @@
  * - admin approves an order  -> order is sent to the provider (action=add)
  * - syncs provider status back into Firestore (inprogress -> completed/cancelled)
  * - admin adds services by provider service ID + own name/price
+ * - POST /api/chat proxies the website chatbot to Groq (key stays on the server)
  */
 const crypto = require('crypto');
 const express = require('express');
@@ -22,6 +23,9 @@ const ORIGINS = env('ALLOWED_ORIGINS').split(',').map((s) => s.trim().replace(/\
 const TO_INR = Number(env('PROVIDER_CURRENCY_TO_INR', '0')) || 0;   // e.g. 90 if provider prices are in USD
 const MARKUP = Number(env('DEFAULT_MARKUP_PERCENT', '30')) || 0;    // used only to suggest a selling price
 const PORT = Number(process.env.PORT) || 3000;
+const GROQ_KEY = env('GROQ_API_KEY');
+const GROQ_MODEL = env('GROQ_MODEL', 'openai/gpt-oss-120b');
+const SITE_NAME = env('SITE_NAME', 'VENOMIX SMM');
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -191,6 +195,50 @@ async function requireAdmin(req, res, next) {
 }
 
 app.get(['/', '/health'], (req, res) => res.json({ ok: true, service: 'venomix-backend', time: new Date().toISOString() }));
+
+/* ---------- chatbot (public): the Groq key stays on the server ---------- */
+const CHAT_SYSTEM = `You are the friendly SMM assistant for ${SITE_NAME}. Answer any question about social media marketing, not just the examples: platform growth and algorithms; Instagram, YouTube, Facebook, Telegram, X and TikTok; content planning, creation, captions, hashtags, posting schedules, reach, engagement, analytics, ads, audiences, account safety, creators, and SMM services/panels. Give practical, accurate guidance and adapt it to the platform and goal. If key details are missing, ask one short follow-up or state reasonable assumptions. Distinguish general advice from services this site actually offers; never invent prices or features. Site ordering: choose an available platform/service, enter a public link and quantity, pay via the UPI QR and enter the transaction ID; orders remain Processing until admin approval, then Completed. Request refills from the menu using the order ID; support is on Telegram. Never ask for passwords, promise guaranteed results, or recommend spam or policy evasion. Formatting rules: reply in plain, clear English with short complete sentences. Use "- " for bullets (max 4) and "1." for steps when needed. Do not use headings, tables or emojis. Keep replies concise (usually under 80 words) and ALWAYS finish your last sentence. For unrelated topics, briefly redirect to SMM.`;
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000, limit: 15, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many messages. Please wait a minute and try again.' }
+});
+app.post('/api/chat', chatLimiter, ah(async (req, res) => {
+  if (!GROQ_KEY) throw new HttpError(503, 'Chatbot is not configured yet.');
+  const raw = req.body && req.body.messages;
+  if (!Array.isArray(raw) || !raw.length) throw new HttpError(422, 'No messages sent');
+  const messages = raw.slice(-10)
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+    .map((m) => ({ role: m.role, content: m.content.trim().slice(0, 1500) }));
+  if (!messages.length || messages[messages.length - 1].role !== 'user') throw new HttpError(422, 'Last message must be from the user');
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 30000);
+  let r, j;
+  try {
+    r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + GROQ_KEY },
+      body: JSON.stringify({ model: GROQ_MODEL, temperature: 0.4, max_tokens: 1200, reasoning_effort: 'low',
+        messages: [{ role: 'system', content: CHAT_SYSTEM }, ...messages] }),
+      signal: ctl.signal
+    });
+    j = await r.json().catch(() => null);
+  } catch (e) {
+    throw new HttpError(502, e.name === 'AbortError' ? 'The assistant took too long. Please try again.' : 'Could not reach the assistant.');
+  } finally { clearTimeout(timer); }
+
+  if (!r.ok) {
+    console.error('Groq error', r.status, j && j.error && j.error.message);
+    if (r.status === 429) throw new HttpError(429, 'The assistant is busy. Please try again in a moment.');
+    throw new HttpError(502, 'The assistant is unavailable right now.');
+  }
+  const ch = j && j.choices && j.choices[0];
+  let reply = ch && ch.message && ch.message.content;
+  if (typeof reply !== 'string') throw new HttpError(502, 'The assistant returned an empty answer.');
+  reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  if (!reply) throw new HttpError(502, 'The assistant returned an empty answer.');
+  res.json({ reply, finish: ch.finish_reason || '' });
+}));
 
 /* ---------- diagnostics (admin only): shows exactly what is misconfigured ---------- */
 app.get('/api/admin/diagnostics', requireAdmin, ah(async (req, res) => {
@@ -427,6 +475,7 @@ process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e))
 app.listen(PORT, () => {
   console.log('VENOMIX backend listening on ' + PORT);
   if (!PROVIDER_KEY) console.warn('WARNING: PROVIDER_API_KEY is not set');
+  if (!GROQ_KEY) console.warn('WARNING: GROQ_API_KEY is not set, the chatbot will not answer');
   if (!ORIGINS.length) console.warn('WARNING: ALLOWED_ORIGINS is empty, any website can call this API (admin routes still need a login)');
   db.collection('platforms').limit(1).get()
     .then(() => console.log('Firestore connection OK'))
