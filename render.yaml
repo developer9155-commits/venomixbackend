@@ -21,6 +21,12 @@ services:
         sync: false
       - key: CRON_SECRET
         sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: SITE_NAME
+        value: VENOMIX SMM
       - key: PROVIDER_CURRENCY_TO_INR
         value: "0"
       - key: DEFAULT_MARKUP_PERCENT
